@@ -228,37 +228,38 @@
 
 
 
-
-
-
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Literal, Optional
-import json
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, status
+from typing import Annotated
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field
 from jose import jwt, JWTError
 from config.region_tier import areas, regions  # Assuming you have this file
+from email_service import send_email
+import os
+from dotenv import load_dotenv
 
-# JWT config
-SECRET_KEY = "9b1e82e5ba5870777e72d844869326c695f5c55edc9c18555594a65d681fe476"  # Change in production!
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+# SQLAlchemy imports
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+from database import engine, get_db, Base
+from models.model_db import DBUser  # Your DBUser model
 
-# Fake DB (replace with real DB in production)
-fake_users_db = {
-    "barakadaudi": {
-        "username": "barakadaudi",
-        "full_name": "Baraka Daudi",
-        "email": "barakadaudi@example.com",
-        "password": "secret",
-        "hashed_password": "$2b$12$3JsBnATTEoF8pD/GLWLVj.vTiKwSB0oJb93P2CGqeuPHA8zL7ad9S",  # bcrypt for 'secret'
-        "disabled": False,
-    }
-}
+load_dotenv()
+
+# Critical: No fallback – SECRET_KEY must be in .env
+SECRET_KEY = os.getenv("SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("SECRET_KEY is not set in .env – this is required for security!")
+
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 class Token(BaseModel):
     access_token: str
@@ -274,10 +275,12 @@ class User(BaseModel):
     disabled: bool | None = None
 
 class UserInDB(User):
+    id:int
     hashed_password: str
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+class RegisterInput(BaseModel):
+    email: str
+    password: str = Field(min_length=8)
 
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
@@ -285,18 +288,24 @@ def verify_password(plain_password, hashed_password):
 def get_password_hash(password):
     return pwd_context.hash(password)
 
-def get_user(db, identifier: str):
-    # Check by username first
-    if identifier in db:
-        return UserInDB(**db[identifier])
-    # Then by email
-    for user_dict in db.values():
-        if user_dict.get("email") == identifier:
-            return UserInDB(**user_dict)
+def get_user(identifier: str, db: Session):
+    # Query DB by username or email
+    user = db.query(DBUser).filter(DBUser.username == identifier).first()
+    if not user:
+        user = db.query(DBUser).filter(DBUser.email == identifier).first()
+    if user:
+        return UserInDB(
+            id=user.id,
+            username=user.username,
+            email=user.email,
+            full_name=user.full_name,
+            disabled=user.disabled,
+            hashed_password=user.hashed_password
+        )
     return None
 
-def authenticate_user(db, identifier: str, password: str):
-    user = get_user(db, identifier)
+def authenticate_user(identifier: str, password: str, db: Session):
+    user = get_user(identifier, db)
     if not user or not verify_password(password, user.hashed_password):
         return False
     return user
@@ -307,7 +316,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
-async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
+async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)], db: Session = Depends(get_db)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -318,10 +327,9 @@ async def get_current_user(token: Annotated[str, Depends(oauth2_scheme)]):
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
-        token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user(fake_users_db, token_data.username)
+    user = get_user(username, db)
     if user is None:
         raise credentials_exception
     return user
@@ -331,10 +339,21 @@ async def get_current_active_user(current_user: Annotated[User, Depends(get_curr
         raise HTTPException(status_code=400, detail="Inactive user")
     return current_user
 
-app = FastAPI(title="Insurance Premium Predictor API")
+app = FastAPI(title=os.getenv("APP_TITLE", "Insurance Premium Predictor API"))
 
-origins = ["*", "http://localhost", "http://localhost:8501", "http://127.0.0.1:8501"]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Create tables on startup (moved after app definition)
+@app.on_event("startup")
+def on_startup():
+    Base.metadata.create_all(bind=engine)
 
 @app.get("/")
 def root():
@@ -344,46 +363,58 @@ def root():
 def about():
     return {"message": "Predict insurance premium categories"}
 
-# ======================
-# Authentication Routes
-# ======================
-
 @app.post("/token")
-async def login_for_access_token(form_data: Annotated[OAuth2PasswordRequestForm, Depends()]) -> Token:
-    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+async def login_for_access_token(
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    db: Session = Depends(get_db)
+) -> Token:
+    user = authenticate_user(form_data.username, form_data.password, db)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect username/email or password")
-    access_token = create_access_token(data={"sub": user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    access_token = create_access_token(
+        data={
+            "sub": user.username,
+            "uid": user.id  # Added for improvement
+        },
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     return Token(access_token=access_token, token_type="bearer")
 
 @app.post("/auth/register")
-def register(email: str, password: str):
-    # Check if email already exists
-    if any(u["email"] == email for u in fake_users_db.values()):
-        raise HTTPException(400, "Email already registered")
+def register(
+    register_input: RegisterInput,
+    db: Session = Depends(get_db)
+):
+    # Normalize email
+    email = register_input.email.strip().lower()
     
-    # Generate username from email (e.g., barakadaudi from barakadaudi@example.com)
-    username = email.split("@")[0].lower()
-    if username in fake_users_db:
-        raise HTTPException(400, "Username conflict; try a different email")
-    
-    hashed_password = get_password_hash(password)
-    fake_users_db[username] = {
-        "username": username,
-        "email": email,
-        "hashed_password": hashed_password,
-        "full_name": None,
-        "disabled": False,
-    }
+    # Check if email or username already exists in DB
+    username = email.split("@")[0]
+    existing_user = db.query(DBUser).filter(
+        or_(
+            DBUser.email == email,
+            DBUser.username == username
+        )
+    ).first()
+    if existing_user:
+        raise HTTPException(400, "Email or username already registered")
+
+    hashed_password = get_password_hash(register_input.password)
+    new_user = DBUser(
+        username=username,
+        email=email,
+        hashed_password=hashed_password,
+        full_name=None,  # Can add later if needed
+        disabled=False
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
     return JSONResponse(status_code=201, content={"message": "User registered successfully"})
 
 @app.get("/users/me/", response_model=User)
 async def read_users_me(current_user: Annotated[User, Depends(get_current_active_user)]):
     return current_user
-
-# ======================
-# Prediction Model
-# ======================
 
 class PredictionInput(BaseModel):
     age: int
@@ -398,8 +429,10 @@ class PredictionInput(BaseModel):
     occupation: str
 
 @app.post("/predict")
-def predict(data: PredictionInput, current_user: Annotated[User, Depends(get_current_active_user)]):
-    # Dummy logic (replace with your ML model)
+def predict(
+    data: PredictionInput,
+    current_user: Annotated[User, Depends(get_current_active_user)]
+):
     height_m = data.height_cm / 100
     bmi = data.weight_kg / (height_m ** 2) if height_m > 0 else 0
     risk = "high" if (data.smoker and bmi > 30) or data.condition != "none" else \
@@ -411,9 +444,14 @@ def predict(data: PredictionInput, current_user: Annotated[User, Depends(get_cur
         "input_received": data.model_dump()
     }
 
-# (Optional: Keep your patient management endpoints if needed, but commented out here for brevity)
-
-
+@app.get("/test-email")
+def test_email():
+    status = send_email(
+        to_email="your_other_email@gmail.com",
+        subject="SendGrid works!",
+        html_content="<h2>Your email setup is successful 🚀</h2>"
+    )
+    return {"status": status}
 
 
 
